@@ -1,25 +1,37 @@
 {
   "expo": {
-    "name": "portfolio-tracker",
+    "name": "Portfolio Tracker",
     "slug": "portfolio-tracker",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "automatic",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": true,
+      "bundleIdentifier": "com.mohamed.portfoliotracker"
     },
     "android": {
       "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
+        "backgroundColor": "#0B0F14",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "package": "com.mohamed.portfoliotracker",
+      "backgroundColor": "#0B0F14"
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-secure-store",
+      "expo-router",
+      "@react-native-community/datetimepicker"
+    ],
+    "scheme": "portfoliotracker",
+    "experiments": {
+      "typedRoutes": true
     }
   }
 }
