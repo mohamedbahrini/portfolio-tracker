@@ -17,6 +17,8 @@ export interface SyncProgress {
   done: number;
   total: number;
   current: string;
+  /** Set while waiting for the next minute's batch: when it starts (epoch ms). */
+  nextBatchAt?: number;
 }
 
 export interface SyncResult extends SyncState {
@@ -28,6 +30,8 @@ export interface SyncOptions {
   transactions: readonly Transaction[];
   state: SyncState;
   baseCurrency: string;
+  /** Requests sent together; match the plan's credits per minute. */
+  batchSize?: number;
   onProgress?: (progress: SyncProgress) => void;
 }
 
@@ -42,6 +46,7 @@ function startDateFor(cachedLast: ISODate | undefined, earliestNeeded: ISODate):
  */
 export async function syncPrices(options: SyncOptions): Promise<SyncResult> {
   const { api, transactions, baseCurrency, onProgress } = options;
+  const batchSize = Math.max(1, options.batchSize ?? 8);
   const prices: PriceTable = { ...options.state.prices };
   const fx: PriceTable = { ...options.state.fx };
   const currencies = { ...options.state.currencies };
@@ -62,10 +67,10 @@ export async function syncPrices(options: SyncOptions): Promise<SyncResult> {
   // FX work is unknown until currencies are learned; estimate with what's cached.
   let total = instruments.length + countFxPairs(currencies, firstTrade.keys(), baseCurrency);
   let done = 0;
-  const report = (current: string) => onProgress?.({ done, total, current });
+  let current = '';
+  const report = () => onProgress?.({ done, total, current });
 
   const run = async (label: string, task: () => Promise<void>) => {
-    report(label);
     try {
       await task();
     } catch (err) {
@@ -73,18 +78,35 @@ export async function syncPrices(options: SyncOptions): Promise<SyncResult> {
       errors.push({ item: label, message: err instanceof Error ? err.message : String(err) });
     }
     done++;
-    report(label);
+    report();
   };
 
-  for (const [key, ref] of instruments) {
-    await run(key, async () => {
-      const cached = prices[key];
-      const start = startDateFor(cached?.[cached.length - 1]?.date, ref.date);
-      const series = await api.getDailySeries({ symbol: ref.symbol, exchange: ref.exchange }, start);
-      prices[key] = mergeBars(cached ?? [], series.bars);
-      currencies[key] = series.currency;
-    });
-  }
+  /**
+   * Sends requests `batchSize` at a time. Each batch runs in parallel; the shared rate
+   * limiter holds the next batch until the minute has rolled over. An auth error stops
+   * everything after the current batch.
+   */
+  const runInBatches = async (jobs: [string, () => Promise<void>][]) => {
+    for (let i = 0; i < jobs.length; i += batchSize) {
+      const batch = jobs.slice(i, i + batchSize);
+      current = batch.map(([label]) => label).join(', ');
+      report();
+      await Promise.all(batch.map(([label, task]) => run(label, task)));
+    }
+  };
+
+  await runInBatches(
+    instruments.map(([key, ref]) => [
+      key,
+      async () => {
+        const cached = prices[key];
+        const start = startDateFor(cached?.[cached.length - 1]?.date, ref.date);
+        const series = await api.getDailySeries({ symbol: ref.symbol, exchange: ref.exchange }, start);
+        prices[key] = mergeBars(cached ?? [], series.bars);
+        currencies[key] = series.currency;
+      },
+    ]),
+  );
 
   // Earliest date each FX pair is needed from.
   const fxNeeded = new Map<string, { from: string; date: ISODate }>();
@@ -99,15 +121,18 @@ export async function syncPrices(options: SyncOptions): Promise<SyncResult> {
   }
   total = instruments.length + fxNeeded.size;
 
-  for (const [pair, need] of fxNeeded) {
-    await run(pair, async () => {
-      const cached = fx[pair];
-      // Start a few days early so the first trade day has a rate even if it was a holiday.
-      const start = startDateFor(cached?.[cached.length - 1]?.date, addDays(need.date, -7));
-      const series = await api.getDailySeries({ symbol: pair }, start);
-      fx[pair] = mergeBars(cached ?? [], series.bars);
-    });
-  }
+  await runInBatches(
+    [...fxNeeded].map(([pair, need]) => [
+      pair,
+      async () => {
+        const cached = fx[pair];
+        // Start a few days early so the first trade day has a rate even if it was a holiday.
+        const start = startDateFor(cached?.[cached.length - 1]?.date, addDays(need.date, -7));
+        const series = await api.getDailySeries({ symbol: pair }, start);
+        fx[pair] = mergeBars(cached ?? [], series.bars);
+      },
+    ]),
+  );
 
   return { prices, fx, currencies, errors };
 }

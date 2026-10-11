@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { getSharedLimiter } from '@/api/rateLimiter';
 import { TwelveDataError, createTwelveDataClient } from '@/api/twelveData';
 import type { InstrumentKey, PriceTable } from '@/domain/types';
 import { syncPrices, type SyncProgress } from '@/services/priceSync';
@@ -43,15 +44,25 @@ export const usePriceStore = create<PriceState>()(
         }
         const { transactions } = usePortfolioStore.getState();
         set({ status: { kind: 'syncing' } });
+        const limiter = getSharedLimiter(creditsPerMinute);
+        let latest: SyncProgress | undefined;
+        // Show a countdown while the next batch waits for the minute to roll over.
+        const stopWatching = limiter.onWait((nextBatchAt) => {
+          if (latest) set({ status: { kind: 'syncing', progress: { ...latest, nextBatchAt } } });
+        });
         try {
-          const api = createTwelveDataClient({ apiKey, creditsPerMinute });
+          const api = createTwelveDataClient({ apiKey, creditsPerMinute, limiter });
           const { prices, fx, currencies } = get();
           const result = await syncPrices({
             api,
             transactions,
             baseCurrency,
+            batchSize: creditsPerMinute,
             state: { prices, fx, currencies },
-            onProgress: (progress) => set({ status: { kind: 'syncing', progress } }),
+            onProgress: (progress) => {
+              latest = progress;
+              set({ status: { kind: 'syncing', progress } });
+            },
           });
           set({
             prices: result.prices,
@@ -69,6 +80,8 @@ export const usePriceStore = create<PriceState>()(
                 ? err.message
                 : 'Price update failed';
           set({ status: { kind: 'error', message } });
+        } finally {
+          stopWatching();
         }
       },
 

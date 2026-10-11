@@ -147,7 +147,7 @@ export default function SettingsScreen() {
             else setCredits(String(creditsPerMinute));
           }}
           keyboardType="number-pad"
-          hint="8 on the free plan. Raise it if you have a paid plan."
+          hint="Prices are fetched in batches of this size, one batch per minute. 8 on the free plan."
         />
         <Button title="Clear price cache" variant="danger" onPress={onClearCache} />
       </Card>

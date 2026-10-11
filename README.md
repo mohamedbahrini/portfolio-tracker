@@ -51,7 +51,9 @@ Symbols: US tickers work as-is (`AAPL`, `VOO`). For other listings add the excha
 
 ## API usage
 - One request (= 1 credit) per symbol and per FX pair. Full history is fetched once; later syncs only request the last few days.
-- A sliding-window rate limiter keeps requests within your plan's credits/minute (configurable), and 429 responses are retried after a minute.
+- Requests go out in batches of 8 (your plan's credits per minute, configurable in Settings): one batch is sent in parallel, then the app waits for a fresh minute before the next batch. 20 symbols take three batches, about 2 minutes. A countdown shows while it waits.
+- Every Twelve Data call in the app (syncing, adding a trade, verifying the key) shares the same 8-per-minute budget.
+- If Twelve Data still answers 429 (e.g. the key is used elsewhere), the request is retried once in the next minute's batch, then reported as a warning.
 - The key is sent in the `Authorization` header, never in the URL, and is stored with `expo-secure-store` (Android Keystore).
 
 ## Project structure

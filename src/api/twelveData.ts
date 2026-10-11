@@ -1,5 +1,5 @@
 import type { DailyBar, ISODate } from '@/domain/types';
-import { RateLimiter, defaultSleep, type Sleep } from './rateLimiter';
+import { getSharedLimiter, type RateLimiter } from './rateLimiter';
 
 const BASE_URL = 'https://api.twelvedata.com';
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -76,17 +76,18 @@ export interface TwelveDataOptions {
   apiKey: string;
   /** Credits per minute allowed by the plan (free plan: 8). */
   creditsPerMinute?: number;
-  /** How many times to wait and retry after a 429. */
+  /** How many times to retry in the next minute's batch after a 429. */
   maxRetries?: number;
   fetchFn?: typeof fetch;
-  sleep?: Sleep;
+  /** Defaults to the app-wide limiter so all calls share one budget. */
+  limiter?: RateLimiter;
 }
 
 /** Typed client for the parts of the Twelve Data REST API this app uses. */
 export function createTwelveDataClient(options: TwelveDataOptions): PriceApi {
-  const { apiKey, creditsPerMinute = 8, maxRetries = 2, fetchFn = fetch, sleep = defaultSleep } = options;
+  const { apiKey, creditsPerMinute = 8, maxRetries = 1, fetchFn = fetch } = options;
   if (!apiKey.trim()) throw new TwelveDataError('Missing Twelve Data API key', 401);
-  const limiter = new RateLimiter(creditsPerMinute, 60_000, sleep);
+  const limiter = options.limiter ?? getSharedLimiter(creditsPerMinute);
 
   async function request<T>(path: string, params: Record<string, string | undefined>): Promise<T> {
     const query = Object.entries(params)
@@ -99,9 +100,10 @@ export function createTwelveDataClient(options: TwelveDataOptions): PriceApi {
       await limiter.acquire();
       const body = await fetchJson(url);
       if (isError(body)) {
-        if (body.code === 429 && attempt < maxRetries) {
-          await sleep(60_000); // credits refill every minute
-          continue;
+        if (body.code === 429) {
+          // Credits for this minute are gone (e.g. key used elsewhere): wait for the next batch.
+          limiter.exhaust();
+          if (attempt < maxRetries) continue;
         }
         throw new TwelveDataError(body.message || 'Twelve Data request failed', body.code);
       }

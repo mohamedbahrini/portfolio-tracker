@@ -1,3 +1,4 @@
+import { RateLimiter } from '@/api/rateLimiter';
 import { TwelveDataError, createTwelveDataClient, type PriceApi } from '@/api/twelveData';
 import type { Transaction } from '@/domain/types';
 import { syncPrices } from '../priceSync';
@@ -57,6 +58,40 @@ describe('syncPrices', () => {
     expect(api.calls).toEqual(['AAPL@2026-09-26']);
   });
 
+  it('sends symbols in batches and never more than the batch size at once', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const batches: string[][] = [];
+    const api = fakeApi({
+      getDailySeries: async (ref) => {
+        inFlight++;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 1));
+        inFlight--;
+        return { symbol: ref.symbol, currency: 'USD', bars: [] };
+      },
+    });
+    const many: Transaction[] = Array.from({ length: 19 }, (_, i) => ({
+      ...baseTx,
+      id: String(i),
+      symbol: `S${i}`,
+      date: '2026-01-02',
+    }));
+    await syncPrices({
+      api,
+      transactions: many,
+      state: { prices: {}, fx: {}, currencies: {} },
+      baseCurrency: 'USD',
+      batchSize: 8,
+      onProgress: (p) => {
+        const labels = p.current.split(', ');
+        if (batches[batches.length - 1]?.join() !== labels.join()) batches.push(labels);
+      },
+    });
+    expect(peak).toBe(8);
+    expect(batches.map((b) => b.length)).toEqual([8, 8, 3]);
+  });
+
   it('aborts on authentication errors', async () => {
     const api = fakeApi({
       getDailySeries: async () => {
@@ -85,7 +120,11 @@ describe('createTwelveDataClient', () => {
         ],
       }),
     );
-    const client = createTwelveDataClient({ apiKey: 'k', fetchFn: fetchFn as unknown as typeof fetch });
+    const client = createTwelveDataClient({
+      apiKey: 'k',
+      fetchFn: fetchFn as unknown as typeof fetch,
+      limiter: new RateLimiter(8),
+    });
     const series = await client.getDailySeries({ symbol: 'AAPL' }, '2026-10-01');
     expect(series.bars).toEqual([
       { date: '2026-10-08', close: 225.1 },
@@ -98,20 +137,38 @@ describe('createTwelveDataClient', () => {
     expect((init.headers as Record<string, string>).Authorization).toBe('apikey k');
   });
 
-  it('retries after a rate-limit error', async () => {
-    const sleep = jest.fn(async () => undefined);
+  it('after a 429, retries once in the next minute', async () => {
+    let now = 0;
+    const sleep = jest.fn(async (ms: number) => {
+      now += ms;
+    });
+    const limiter = new RateLimiter(8, 60_000, sleep, () => now);
     const fetchFn = jest
       .fn()
       .mockResolvedValueOnce(response({ status: 'error', code: 429, message: 'limit' }))
       .mockResolvedValueOnce(response({ status: 'ok', meta: { symbol: 'X' }, values: [] }));
-    const client = createTwelveDataClient({ apiKey: 'k', fetchFn, sleep });
+    const client = createTwelveDataClient({ apiKey: 'k', fetchFn, limiter });
     await expect(client.getDailySeries({ symbol: 'X' }, '2026-01-01')).resolves.toMatchObject({ bars: [] });
-    expect(sleep).toHaveBeenCalledWith(60_000);
+    expect(fetchFn).toHaveBeenCalledTimes(2);
+    expect(now).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('gives up after one retry', async () => {
+    let now = 0;
+    const limiter = new RateLimiter(8, 60_000, async (ms) => void (now += ms), () => now);
+    const fetchFn = jest.fn(async () => response({ status: 'error', code: 429, message: 'limit' }));
+    const client = createTwelveDataClient({ apiKey: 'k', fetchFn: fetchFn as unknown as typeof fetch, limiter });
+    await expect(client.getQuote({ symbol: 'X' })).rejects.toMatchObject({ isRateLimit: true });
+    expect(fetchFn).toHaveBeenCalledTimes(2);
   });
 
   it('surfaces API errors with their code', async () => {
     const fetchFn = jest.fn(async () => response({ status: 'error', code: 401, message: 'bad key' }));
-    const client = createTwelveDataClient({ apiKey: 'k', fetchFn: fetchFn as unknown as typeof fetch });
+    const client = createTwelveDataClient({
+      apiKey: 'k',
+      fetchFn: fetchFn as unknown as typeof fetch,
+      limiter: new RateLimiter(8),
+    });
     await expect(client.getQuote({ symbol: 'X' })).rejects.toMatchObject({ code: 401, isAuth: true });
   });
 });
